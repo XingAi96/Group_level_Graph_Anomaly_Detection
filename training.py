@@ -1,46 +1,19 @@
-import torch
+import os
 from utils import *
 from tqdm import tqdm
 from initializer import *
-from GCL.eval import get_split, SVMEvaluator
+from pyod.models.ecod import ECOD
 from torch_geometric.utils import to_dense_adj
-import os
+from sklearn.metrics import f1_score, roc_auc_score
+
 os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
 
-def filter_subgraph(args, data, anomaly_score, device, sample_type='connected_components'):
+def filter_subgraph(args, data, anomaly_score):
 
     # obtain the candidate subgraph
     threshold = np.percentile(anomaly_score, q=args.q)
-
-    if sample_type == 'connected_components':
-        residual_edge_index, _ = subgraph(
-            torch.arange(data.num_nodes)[anomaly_score > threshold].to(device),
-            data.edge_index,
-            relabel_nodes=True
-        )
-        residal_data = Data(
-            # x=torch.tensor(mean_error_list[mean_error_list > threshold]).view(-1, 1),
-            x=data.x[anomaly_score > threshold],
-            edge_index=residual_edge_index,
-        )
-        # find components
-        residual_nx = to_networkx(
-            residal_data,
-            to_undirected=True,
-            remove_self_loops=True
-        )
-        batch = torch.zeros(residal_data.num_nodes, dtype=torch.long)
-        components = list(nx.connected_components(residual_nx))
-        y, batch, is_mix, complete_ratio, comp_size = GraphProcessor().relabel(data, components, batch)
-        residal_data.batch = batch
-        residal_data.y = torch.from_numpy(np.array(y))
-        residal_data.to(data.x.device)
-
-        return residal_data, is_mix, complete_ratio
-
-    elif sample_type == 'center_node':
-        candi_groups, residal_data, sub_size = GraphProcessor().sample_sub(data, anomaly_score, threshold)
-        return residal_data, candi_groups, sub_size
+    candi_groups, residal_data, sub_size = GraphProcessor().sample_sub(data, anomaly_score, threshold)
+    return residal_data, candi_groups, sub_size
 
 
 def train_GAE(args, data, model, optimizer=None, is_training=True):
@@ -129,7 +102,7 @@ def train_GCL(args, encoder_model, contrast_model, dataloader, optimizer):
     return epoch_loss, [encoder_model, contrast_model]
 
 
-def train(args, data, device):
+def train(args, data):
 
     # inizialize models
     GAE, GCL, opt_gae, opt_gcl = initialize_model(args)
@@ -138,12 +111,12 @@ def train(args, data, device):
     errors = train_GAE(args, data, GAE, optimizer=opt_gae, is_training=True)
 
     # filter
-    residal_data, candi_groups, sub_size = filter_subgraph(args, data, errors, device, args.sample_type)
+    residal_data, candi_groups, sub_size = filter_subgraph(args, data, errors)
 
     # preprocessing for locate critical edges and nodes of each batch
     batch_list, cycle_edges_list, tree_root_list, path_middle_list, one_degree_list = [], [], [], [], []
     for rdata in [residal_data]:
-        cycle_edges, tree_root_nodes, del_edge_index, one_degree_nodes = GraphProcessor().sample_aug_sub(rdata)
+        cycle_edges, tree_root_nodes, del_edge_index, one_degree_nodes = GraphProcessor().pattern_search(rdata)
         batch_list.append(rdata)
         cycle_edges_list.append(cycle_edges)
         tree_root_list.append(tree_root_nodes)
@@ -161,112 +134,39 @@ def train(args, data, device):
     return GAE, GCL, batch_list
 
 
-def test(args, GAE, GCL, data, device):
-    from sklearn.ensemble import IsolationForest
-    from sklearn.covariance import EllipticEnvelope
-    from sklearn.neighbors import LocalOutlierFactor
-    from sklearn.metrics import f1_score
-    from sklearn.svm import OneClassSVM
-    from pyod.models.abod import ABOD
-    from pyod.models.cblof import CBLOF
-    from pyod.models.ecod import ECOD
-    from PyNomaly import loop
-    from sklearn.cluster import DBSCAN
-    from sklearn.metrics import roc_auc_score
+def test(args, GAE, GCL, data):
 
     GCL_encoder, contrast_model = GCL[0], GCL[1]
     GAE.eval()
     GCL_encoder.eval()
 
     errors = train_GAE(args, data, GAE, optimizer=None, is_training=False)
-    residal_data, candi_groups, sub_size = filter_subgraph(args, data, errors, device, args.sample_type)
+    residal_data, candi_groups, sub_size = filter_subgraph(args, data, errors)
 
     batch_list, cycle_edges_list, tree_root_list, path_middle_list, one_degree_list = [], [], [], [], []
     for rdata in [residal_data]:
-        cycle_edges, tree_root_nodes, del_edge_index, one_degree_nodes = GraphProcessor().sample_aug_sub(rdata)
+        cycle_edges, tree_root_nodes, del_edge_index, one_degree_nodes = GraphProcessor().pattern_search(rdata)
         batch_list.append(rdata)
         cycle_edges_list.append(cycle_edges)
         tree_root_list.append(tree_root_nodes)
         path_middle_list.append(del_edge_index)
         one_degree_list.append(one_degree_nodes)
-    # _, g, _, _, g1, g2 = GCL_encoder(residal_data.x, residal_data.edge_index, residal_data.batch,
-    #            cycle_edges_list[0], tree_root_list[0], path_middle_list[0], one_degree_list[0])
-
-    # skip TPGCL
-    groups = []
-    for gid in range(residal_data.y.shape[0]):
-        indicator = torch.where(residal_data.batch == gid, 1, 0)
-        if np.sum(indicator.cpu().numpy()) == 0 or len(list(indicator.cpu().numpy())) == 0:
-            embedding = np.zeros(residal_data.x.cpu().numpy().shape[1])
-        else:
-            try:
-                node_list = list(torch.nonzero(indicator).cpu().squeeze().numpy())
-                embedding = residal_data.x[node_list].cpu().numpy()
-                embedding = np.mean(embedding, axis=0)
-            except:
-                embedding = np.zeros(residal_data.x.cpu().numpy().shape[1])
-        groups.append(embedding)
-    groups = np.array(groups)
-    g = torch.from_numpy(groups)
-
-    # _, g, _, _, _, _ = GCL_encoder(residal_data.x, residal_data.edge_index, residal_data.batch)
+    _, g, _, _, _, _ = GCL_encoder(residal_data.x, residal_data.edge_index, residal_data.batch)
 
     x, y = [], []
     x.append(g)
     y.append(residal_data.y)
     x = torch.cat(x, dim=0).detach().cpu().numpy()
     y = torch.cat(y, dim=0).detach().cpu().numpy()
-
-    # Visualizor().embedding_visualization(x,y,args.real_world_name)
-
-    '''
-    print(sum(is_mix), len(is_mix)-sum(is_mix))
-    print('<=0.1 : ' + str(com_ratio[0]))
-    print('0.1-0.4 : ' + str(com_ratio[1]))
-    print('0.4-0.7 : ' + str(com_ratio[2]))
-    print('0.7-0.999 : ' + str(com_ratio[3]))
-    print('1.0 : ' + str(com_ratio[4]))
-
-    print('<=0.1 : ' + str(red_ration[0]))
-    print('0.1-0.4 : ' + str(red_ration[1]))
-    print('0.4-0.7 : ' + str(red_ration[2]))
-    print('0.7-0.999 : ' + str(red_ration[3]))
-    print('1.0 : ' + str(red_ration[4]))
-    '''
-    split = get_split(num_samples=x.shape[0], train_ratio=0.8, test_ratio=0.1)
-
-    keys = ['train', 'test', 'valid']
-    objs = [x, y]
-    x_train, x_test, x_val, y_train, y_test, y_val = [obj[split[key]] for obj in objs for key in keys]
-
-    #cls = IsolationForest(random_state=0).fit(x_train)
-    #cls = EllipticEnvelope(contamination=0.1).fit(x_train)
-    #cls = LocalOutlierFactor().fit(x_train)
-    #cls = OneClassSVM().fit(x_train)
-    #m = loop.LocalOutlierProbability(x, use_numba=True, progress_bar=True).fit()
-    #scores = m.local_outlier_probabilities
-    #cls = DBSCAN().fit(x_train)
-    #cls = ABOD(contamination=1e-1,n_neighbors=10).fit(x_train)
-    #cls = CBLOF(n_clusters=2, contamination=0.3).fit(x_train)
-    #x_train, y_train = x, y
     cls = ECOD(contamination=args.contamination).fit(x)
 
     y_score, y_pre = cls.decision_scores_, cls.labels_
-    test_macro = f1_score(y, y_pre, average='macro')
     test_micro = f1_score(y, y_pre, average='micro')
     try:
         auc = roc_auc_score(y, y_score)
     except:
-        auc = -1
-    cr = CR_calculator(data, candi_groups, y_score, y_pre)
+        auc = 0
+    cr = CR_calculator(data, candi_groups, y_pre)
 
-    result = {'micro_f1': test_micro, 'macro_f1': test_macro, 'auc': auc, 'cr': cr, 'comp_size': sub_size}
-    print(result)
-    '''
-    result = SVMEvaluator(linear=True)(x, y, split)
-    result['auc'] = 0
-    result['cr'] = cr
-    result['comp_size'] = comp_size
-    print(result)
-    '''
+    result = {'f1': test_micro, 'auc': auc, 'cr': cr, 'comp_size': sub_size}
     return result

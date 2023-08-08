@@ -18,7 +18,7 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_dir', type=str, default='./data')
-    parser.add_argument('--real_world_name', type=str, default='Cora')#simML AMLpublic Ethereum_TSGN Citeseer Cora
+    parser.add_argument('--real_world_name', type=str, default='AMLpublic')#simML AMLpublic Ethereum_TSGN Citeseer Cora
     parser.add_argument('--dataset', type=str, default='complete')
     parser.add_argument('--anomaly_type', type=str, default='complete')
     parser.add_argument('--size', type=int, default=200)
@@ -44,12 +44,12 @@ if __name__ == '__main__':
     parser.add_argument('--gcl_hidden_dim', type=int, default=32)
     parser.add_argument('--gcl_num_layer', type=int, default=2)
     parser.add_argument('--gcl_output_dim', type=int, default=16)
-    parser.add_argument('--gcl_epochs', type=int, default=1)#100
+    parser.add_argument('--gcl_epochs', type=int, default=100)
     parser.add_argument('--gcl_lr', type=float, default=1e-2)
     parser.add_argument('--q', type=int, default=90)
     parser.add_argument('--inner_epochs', type=int, default=20)
     parser.add_argument('--inner_lr', type=float, default=1e-4)
-    parser.add_argument('--contamination', type=float, default=0.5)
+    parser.add_argument('--contamination', type=float, default=0.15)
 
     parser.add_argument('--warmup', type=int, default=90)
     parser.add_argument('--alpha', type=float, default=.5)
@@ -65,19 +65,15 @@ if __name__ == '__main__':
     data, anomaly_flag = load_data(args)
     batch = set(data.batch.cpu().numpy())
     data = data.to(device)
-    data.A, data.G = preprocess_data(data, '1')
-
-    # Visualizor().group_pattern_visualization(args.real_world_name, data)
+    data.A, data.G = preprocess_data(data, 's')
 
     # prepar model parameters
     args.gae_out_channels = data.num_features
     args.gae_num_features = data.num_features
     args.gcl_input_dim = data.num_features
 
-    aug1, aug2 = A.SubIncreasing(),A.SubDecreasing()
-    # args.sample_type = 'center_node'  # center_node#connected_components
-
-    f1ma, f1mi, auc, cratio, rration, cr_list = [], [], [], [], [], []
+    args.aug1, args.aug2 = A.SubIncreasing(),A.SubDecreasing()
+    f1, auc, cratio, rration, cr_list = [], [], [], [], []
     for i in range(1, 11):
         bat = data.batch.cpu().numpy().squeeze()
         y = data.y.cpu().numpy()
@@ -85,22 +81,20 @@ if __name__ == '__main__':
         for k in bat:
             if y[k] == 1:
                 ano_node += 1
-        GAEmodel, GCLmodel, batch_list = train(args, data, device)
-        test_result = test(args, GAEmodel, GCLmodel, data, device)
+        GAEmodel, GCLmodel, batch_list = train(args, data)
+        test_result = test(args, GAEmodel, GCLmodel, data)
 
-        print(f'(Epoch-{i}): Best test F1Mi={test_result["micro_f1"]:.4f}, F1Ma={test_result["macro_f1"]:.4f},'
+        print(f'(Epoch-{i}): Best test F1={test_result["f1"]:.4f},'
               f' AUC={test_result["auc"]:.4f}, CR={test_result["cr"]:.4f}')
-        f1ma.append(test_result["macro_f1"])
-        f1mi.append(test_result["micro_f1"])
+        f1.append(test_result["f1"])
         auc.append(test_result["auc"])
         cr_list.append(test_result["cr"])
 
-    f1ma = np.array(f1ma)
-    f1mi = np.array(f1mi)
+    f1 = np.array(f1)
     cr_list = np.array(cr_list)
-    print(args.gae_type + ' with ' + aug1 + '+' + aug2 + ': ')
     print(
-        f'Average test F1Mi={np.mean(f1mi):.4f}, F1Ma={np.mean(f1ma):.4f}, AUC={np.mean(auc):.4f}, CR={np.mean(cr_list):.4f}')
+        f'Average test F1={np.mean(f1):.4f}, AUC={np.mean(auc):.4f}, CR={np.mean(cr_list):.4f}')
     print(
-        f'Std test F1Mi={np.std(f1mi):.3f}, F1Ma={np.std(f1ma):.3f}, AUC={np.std(auc):.3f}, CR={np.std(cr_list):.3f}')
+        f'Std test F1={np.std(f1):.3f}, AUC={np.std(auc):.3f}, CR={np.std(cr_list):.3f}')
+
 
